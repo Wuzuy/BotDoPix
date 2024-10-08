@@ -1,0 +1,259 @@
+// PayCommands.java
+package com.wuzuy.commands;
+
+import com.google.gson.JsonObject;
+import com.wuzuy.database.DatabaseManager;
+import com.wuzuy.integrations.QRCodeGenerator;
+import com.wuzuy.models.ConversationState;
+import com.wuzuy.models.PaymentData;
+import com.wuzuy.pix.PixApiClient;
+import com.wuzuy.pix.TokenGenerator;
+import net.dv8tion.jda.api.EmbedBuilder;
+import net.dv8tion.jda.api.Permission;
+import net.dv8tion.jda.api.entities.MessageEmbed;
+import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
+import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
+import net.dv8tion.jda.api.hooks.ListenerAdapter;
+import net.dv8tion.jda.api.interactions.components.buttons.Button;
+import net.dv8tion.jda.api.utils.FileUpload;
+
+import java.awt.*;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class PayCommands extends ListenerAdapter {
+
+    private static final String PAGAR_BUTTON_ID = "pagar_button";
+
+    @Override
+    public void onMessageReceived(MessageReceivedEvent event) {
+        String messageContent = event.getMessage().getContentRaw();
+        String userId = event.getAuthor().getId();
+
+        if (messageContent.equalsIgnoreCase("$pay")) {
+
+            if(!Objects.requireNonNull(event.getMember()).hasPermission(Permission.ADMINISTRATOR)) {
+                event.getMessage()
+                        .reply("Você não tem permissão o suficiente para executar esse comando!")
+                        .queue();
+                return;
+            }
+
+            ConversationState existingConversation = DatabaseManager.getConversation(userId);
+            if (existingConversation != null) {
+                event.getChannel().sendMessage("Você já iniciou um pagamento. Por favor, complete-o primeiro.").queue();
+                return;
+            }
+
+            ConversationState state = new ConversationState();
+            state.setUserId(userId);
+            state.setCurrentStep(ConversationState.Step.AWAITING_TITLE);
+            DatabaseManager.upsertConversation(state);
+
+            event.getChannel().sendMessage("Por favor, informe o **título** do pagamento:").queue(message -> {
+                state.setBotMessageId(message.getId());
+                DatabaseManager.upsertConversation(state);
+            });
+        } else {
+            ConversationState state = DatabaseManager.getConversation(userId);
+            if (state == null) {
+                return;
+            }
+
+            switch (state.getCurrentStep()) {
+                case AWAITING_TITLE:
+                    state.setTitulo(messageContent);
+                    state.setCurrentStep(ConversationState.Step.AWAITING_DESCRIPTION);
+                    DatabaseManager.upsertConversation(state);
+
+                    event.getChannel().deleteMessageById(event.getMessageId()).queue();
+                    if (state.getBotMessageId() != null) {
+                        event.getChannel().deleteMessageById(state.getBotMessageId()).queue();
+                    }
+
+                    event.getChannel().sendMessage("Por favor, informe a **descrição** do pagamento:").queue(message -> {
+                        state.setBotMessageId(message.getId());
+                        DatabaseManager.upsertConversation(state);
+                    });
+                    break;
+
+                case AWAITING_DESCRIPTION:
+                    state.setDescricao(messageContent);
+                    state.setCurrentStep(ConversationState.Step.AWAITING_VALUE);
+                    DatabaseManager.upsertConversation(state);
+
+                    event.getChannel().deleteMessageById(event.getMessageId()).queue();
+                    if (state.getBotMessageId() != null) {
+                        event.getChannel().deleteMessageById(state.getBotMessageId()).queue();
+                    }
+
+                    event.getChannel().sendMessage("Por favor, informe o **valor** do pagamento:").queue(message -> {
+                        state.setBotMessageId(message.getId());
+                        DatabaseManager.upsertConversation(state);
+                    });
+                    break;
+
+                case AWAITING_VALUE:
+                    
+                    String valorOriginal = messageContent.trim();
+                    String valorFormatado = validarEFormatarValor(valorOriginal);
+
+                    if (valorFormatado == null) {
+                        // Valor inválido, solicitar novamente
+                        event.getChannel().sendMessage("Valor inválido. Por favor, informe o valor no formato \"$,$$\" (exemplo: \"12,34\").").queue();
+                        return;
+                    }
+                    
+                    state.setValor(messageContent);
+                    state.setCurrentStep(ConversationState.Step.COMPLETED);
+                    DatabaseManager.upsertConversation(state);
+
+                    event.getChannel().deleteMessageById(event.getMessageId()).queue();
+                    if (state.getBotMessageId() != null) {
+                        event.getChannel().deleteMessageById(state.getBotMessageId()).queue();
+                    }
+
+                    EmbedBuilder embed = new EmbedBuilder()
+                            .setTitle(state.getTitulo())
+                            .setDescription(state.getDescricao())
+                            .addField("Valor", state.getValor(), false)
+                            .setColor(Color.GREEN)
+                            .setFooter("Clique no botão abaixo para pagar via Pix!");
+
+                    event.getChannel().sendMessageEmbeds(embed.build())
+                            .addActionRow(Button.primary(PAGAR_BUTTON_ID + "_" + UUID.randomUUID(), "Me pague!"))
+                            .queue();
+
+                    DatabaseManager.removeConversation(userId);
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    }
+
+    // fix-me está quebrado, precisa ser corrigido.
+
+    private String validarEFormatarValor(String valorOriginal) {
+        // Define o padrão esperado: um ou mais dígitos, seguido de vírgula e exatamente dois dígitos
+        Pattern pattern = Pattern.compile("^\\d+(.\\d{1,2})?$");
+        Matcher matcher = pattern.matcher(valorOriginal);
+
+        if (matcher.matches()) {
+            if (valorOriginal.matches("^\\d+.\\d$")) {
+                return valorOriginal + "0";
+            }
+            if (valorOriginal.matches("^\\d+$")) {
+                return valorOriginal + ".00";
+            }
+            return valorOriginal;
+        } else {
+            return null;
+        }
+    }
+
+    @Override
+    public void onButtonInteraction(ButtonInteractionEvent event) {
+        String customId = event.getComponentId();
+
+        if (customId.startsWith(PAGAR_BUTTON_ID)) {
+            String userId = event.getUser().getId();
+
+            MessageEmbed embed = event.getMessage().getEmbeds().get(0);
+            String titulo = embed.getTitle();
+            String descricao = embed.getDescription();
+            String valor = embed.getFields().get(0).getValue();
+
+            String uniquePaymentId = UUID.randomUUID().toString();
+
+            DatabaseManager.insertPagamento(uniquePaymentId, valor, titulo, descricao, userId, "Pendente");
+
+            processPayment(event, uniquePaymentId);
+
+        } else if (customId.startsWith("show_qrcode_")) {
+            String uniqueQrCodeId = customId.substring("show_qrcode_".length());
+
+            showQrCode(event, uniqueQrCodeId);
+        }
+    }
+
+    private void processPayment(ButtonInteractionEvent event, String uniquePaymentId) {
+        event.deferReply(true).queue();
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                PaymentData paymentData = DatabaseManager.getPagamento(uniquePaymentId);
+
+                if (!paymentData.getStatus().equalsIgnoreCase("Pendente")) {
+                    event.getHook().sendMessage("Este pagamento já foi processado.").setEphemeral(true).queue();
+                    return;
+                }
+
+                DatabaseManager.updatePagamentoStatus(uniquePaymentId, "Processando");
+
+                int expiracao = 3600; // 1 hora
+                String token = TokenGenerator.getAccessToken();
+                String valor = validarEFormatarValor(paymentData.getValor());
+                String infoPagador = paymentData.getDescricao();
+                String chave = "61b555ee-2975-433a-af8c-785f7608f2a2"; // Sua chave Pix
+
+                JsonObject response = PixApiClient.criarCobrancaPix(token, expiracao, valor, infoPagador, chave);
+
+                String servidorId = Objects.requireNonNull(event.getGuild()).getId();
+                String idCompra = response.get("txid").getAsString();
+                String idUsuario = event.getUser().getId();
+                String status = "Pendente";
+
+                DatabaseManager.insertTransaction(servidorId, idCompra, idUsuario, valor, status);
+
+                DatabaseManager.updatePagamentoDetails(uniquePaymentId, idCompra, "Criado");
+
+                if (response.has("pixCopiaECola")) {
+                    String pixCopia = response.get("pixCopiaECola").getAsString();
+
+                    byte[] qrCodeImage = QRCodeGenerator.generateQRCodeImage(pixCopia, 300, 300);
+
+                    String uniqueQrCodeId = UUID.randomUUID().toString();
+
+                    DatabaseManager.insertQRCode(uniqueQrCodeId, pixCopia);
+
+                    Button showQrCodeButton = Button.primary("show_qrcode_" + uniqueQrCodeId, "Mostrar QR Code");
+
+                    event.getHook().sendMessage("Cobrança Pix criada com sucesso. Pix:")
+                            .addFiles(FileUpload.fromData(qrCodeImage, "qrcode.png"))
+                            .addActionRow(showQrCodeButton)
+                            .queue();
+                } else {
+                    event.getHook().sendMessage("Campo 'pixCopiaECola' não encontrado na resposta.")
+                            .setEphemeral(true)
+                            .queue();
+                }
+            } catch (Exception e) {
+                event.getHook().sendMessage("Erro ao criar a cobrança Pix: " + e.getMessage())
+                        .setEphemeral(true)
+                        .queue();
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void showQrCode(ButtonInteractionEvent event, String uniqueQrCodeId) {
+        String pixCopiaECola = DatabaseManager.getQRCode(uniqueQrCodeId);
+
+        if (pixCopiaECola != null) {
+            event.reply("Aqui está o QR Code em texto:\n```\n" + pixCopiaECola + "\n```")
+                    .setEphemeral(true)
+                    .queue();
+
+            DatabaseManager.removeQRCode(uniqueQrCodeId);
+        } else {
+            event.reply("QR Code não encontrado ou já foi exibido.")
+                    .setEphemeral(true)
+                    .queue();
+        }
+    }
+}

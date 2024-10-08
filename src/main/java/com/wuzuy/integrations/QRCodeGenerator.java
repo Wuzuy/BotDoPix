@@ -1,4 +1,4 @@
-package teste.wuzuy;
+package com.wuzuy.integrations;
 
 import com.google.zxing.BarcodeFormat;
 import com.google.zxing.WriterException;
